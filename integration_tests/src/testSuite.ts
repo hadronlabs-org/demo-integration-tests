@@ -4,7 +4,12 @@ import { StargateClient } from '@cosmjs/stargate';
 import { Client as NeutronClient } from '@neutron-org/client-ts';
 import { waitFor } from './helpers/waitFor';
 import { sleep } from './helpers/sleep';
-import child_process from 'child_process';
+import fs from 'fs';
+import {
+  CosmoparkNetworkConfig,
+  CosmoparkRelayer,
+} from '@neutron-org/cosmopark/lib/types';
+import { Suite } from 'vitest';
 const packageJSON = require(`${__dirname}/../package.json`);
 const VERSION = (process.env.CI ? '_' : ':') + packageJSON.version;
 const ORG = process.env.CI ? 'neutronorg/lionco-contracts:' : '';
@@ -21,6 +26,11 @@ const keys = [
 ] as const;
 
 const TIMEOUT = 10_000;
+
+const redefinedParams =
+  process.env.REMOTE_CHAIN_OPTS && fs.existsSync(process.env.REMOTE_CHAIN_OPTS)
+    ? JSON.parse(fs.readFileSync(process.env.REMOTE_CHAIN_OPTS).toString())
+    : {};
 
 const networkConfigs = {
   lsm: {
@@ -56,18 +66,22 @@ const networkConfigs = {
     post_start: [`/opt/init-lsm.sh > /opt/init-lsm.log 2>&1`],
   },
   gaia: {
-    binary: 'gaiad',
+    binary: redefinedParams.binary || 'gaiad',
     chain_id: 'testgaia',
-    denom: 'stake',
-    image: `${ORG}gaia-test${VERSION}`,
-    prefix: 'cosmos',
+    denom: redefinedParams.denom || 'stake',
+    image: `${ORG}${process.env.REMOTE_CHAIN ?? 'gaia-test'}${VERSION}`,
+    prefix: redefinedParams.prefix || 'cosmos',
     trace: true,
     validators: 2,
-    validators_balance: '1000000000',
-    genesis_opts: {
+    commands: redefinedParams.commands,
+    validators_balance: ['1900000000', '100000000'],
+    genesis_opts: redefinedParams.genesisOpts || {
       'app_state.slashing.params.downtime_jail_duration': '10s',
       'app_state.slashing.params.signed_blocks_window': '10',
+      'app_state.slashing.params.min_signed_per_window': '0.9',
+      'app_state.slashing.params.slash_fraction_downtime': '0.1',
       'app_state.staking.params.validator_bond_factor': '10',
+      'app_state.staking.params.unbonding_time': '1814400s',
       'app_state.mint.minter.inflation': '0.9',
       'app_state.mint.params.inflation_max': '0.95',
       'app_state.mint.params.inflation_min': '0.5',
@@ -84,11 +98,15 @@ const networkConfigs = {
       'api.swagger': true,
       'grpc.enable': true,
       'grpc.address': '0.0.0.0:9090',
-      'minimum-gas-prices': '0stake',
+      'minimum-gas-prices': redefinedParams.denom
+        ? `0${redefinedParams.denom}`
+        : '0stake',
       'rosetta.enable': true,
     },
-    upload: ['./artifacts/scripts/init-gaia.sh'],
-    post_start: [`/opt/init-gaia.sh > /opt/init-gaia.log 2>&1`],
+    upload: redefinedParams.upload || ['./artifacts/scripts/init-gaia.sh'],
+    post_start: redefinedParams.postUpload || [
+      `/opt/init-gaia.sh > /opt/init-gaia.log 2>&1`,
+    ],
   },
   neutron: {
     binary: 'neutrond',
@@ -110,8 +128,8 @@ const networkConfigs = {
       'app_state.crisis.constant_fee.denom': 'untrn',
     },
     config_opts: {
-      'consensus.timeout_commit': '1s',
-      'consensus.timeout_propose': '1s',
+      'consensus.timeout_commit': '500ms',
+      'consensus.timeout_propose': '500ms',
     },
     app_opts: {
       'api.enable': 'true',
@@ -131,10 +149,12 @@ const relayersConfig = {
     balance: '1000000000',
     binary: 'hermes',
     config: {
+      'chains.0.gas_multiplier': 1.2,
       'chains.0.trusting_period': '112h0m0s',
       'chains.0.unbonding_period': '336h0m0s',
       'chains.1.gas_multiplier': 1.2,
-      'chains.0.gas_multiplier': 1.2,
+      'chains.1.trusting_period': '168h0m0s',
+      'chains.1.unbonding_period': '504h0m0s',
     },
     image: `${ORG}hermes-test${VERSION}`,
     log_level: 'trace',
@@ -207,7 +227,6 @@ const awaitNeutronChannels = (rest: string, rpc: string): Promise<void> =>
       }
       await sleep(10000);
     } catch (e) {
-      console.log('Failed to await neutron channels', e);
       await sleep(10000);
       return false;
     }
@@ -226,12 +245,62 @@ export const generateWallets = (): Promise<Record<Keys, string>> =>
     Promise.resolve({} as Record<Keys, string>),
   );
 
+type NetworkOptsType = Partial<Record<keyof typeof networkConfigs | '*', any>>;
+const getNetworkConfig = (
+  network: string,
+  opts: NetworkOptsType = {},
+): CosmoparkNetworkConfig => {
+  let config = networkConfigs[network];
+  const extOpts = opts['*'] || opts[network] || {};
+  for (const [key, value] of Object.entries(extOpts)) {
+    if (typeof value === 'object') {
+      config = { ...config, [key]: { ...config[key], ...value } };
+    } else {
+      config = { ...config, [key]: value };
+    }
+  }
+  return config;
+};
+
+type RelayerOptsType = Partial<Record<keyof typeof relayersConfig, any>>;
+const getRelayerConfig = (
+  relayer: string,
+  opts: RelayerOptsType,
+): CosmoparkRelayer => {
+  relayer;
+  let config = relayersConfig[relayer] || {};
+
+  for (const [key, value] of Object.entries(opts)) {
+    if (typeof value === 'object') {
+      config = { ...config, [key]: { ...config[key], ...value } };
+    } else {
+      config = { ...config, [key]: value };
+    }
+  }
+  return config;
+};
+
+function isSuite(t: any): t is Suite {
+  return t && t.type === 'suite' && t.suite;
+}
+
 export const setupPark = async (
-  context = 'example',
+  t: Readonly<Suite | File>,
   networks: string[] = [],
-  needHermes = false,
-  needNeutronRelayer = false,
+  opts?: NetworkOptsType, // Key is path to the param, value is Record of network name and value
+  relayers: Partial<Record<keyof typeof relayersConfig, any | boolean>> = {},
 ): Promise<cosmopark> => {
+  const context = ((t: Readonly<Suite | File>) => {
+    if (isSuite(t)) {
+      return t.suite.file.filepath
+        ?.split('/')
+        .pop()!
+        .split('.')[0]
+        .replace(/[-_]/g, '');
+    } else {
+      throw new Error('Invalid context');
+    }
+  })(t);
   const wallets = await generateWallets();
   const config: CosmoparkConfig = {
     context,
@@ -249,10 +318,10 @@ export const setupPark = async (
     },
   };
   for (const network of networks) {
-    config.networks[network] = networkConfigs[network];
+    config.networks[network] = getNetworkConfig(network, opts);
   }
   config.relayers = [];
-  if (needHermes) {
+  if (relayers.hermes) {
     const connections = networks.reduce((connections, network, index, all) => {
       if (index === all.length - 1) {
         return connections;
@@ -263,15 +332,21 @@ export const setupPark = async (
       return connections;
     }, []);
     config.relayers.push({
-      ...relayersConfig.hermes,
+      ...getRelayerConfig(
+        'hermes',
+        relayers.hermes === true ? {} : relayers.hermes,
+      ),
       networks,
       connections: connections,
       mnemonic: wallets.hermes,
     } as any);
   }
-  if (needNeutronRelayer) {
+  if (relayers.neutron) {
     config.relayers.push({
-      ...relayersConfig.neutron,
+      ...getRelayerConfig(
+        'neutron',
+        relayers.neutron === true ? {} : relayers.neutron,
+      ),
       networks,
       mnemonic: wallets.neutronqueryrelayer,
     } as any);
@@ -285,16 +360,11 @@ export const setupPark = async (
       }),
     ),
   );
-  if (needHermes) {
+  if (relayers.hermes) {
     await awaitNeutronChannels(
       `127.0.0.1:${instance.ports['neutron'].rest}`,
       `127.0.0.1:${instance.ports['neutron'].rpc}`,
     ).catch((e) => {
-      console.log(
-        child_process
-          .execSync('docker logs corefsm-relayer_hermes0-1')
-          .toString(),
-      );
       console.log(`Failed to await neutron channels: ${e}`);
       throw e;
     });
