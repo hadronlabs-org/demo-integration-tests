@@ -36,6 +36,8 @@ Contracts2ts – is a tool that allows to generate typescript clients for set of
 
 ## How to write your own tests
 
+Let's consider you have written your contract and the contract is located in the `contracts` folder. The contract has a `write_api` method which generates a json schema for the contract. The schema is used to generate a TS client for the contract.
+
 ### Prepare TS client for your contracts
 
 You can see `build-ts-client` script in the `package.json` file. It generates TS client for your contracts. The generated client is compiled ton the `src/contracts` folder.
